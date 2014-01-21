@@ -22,6 +22,8 @@
 import libmilter as lm
 import sys , time , re , requests , gevent
 import simplejson as json
+import logging
+import logging.handlers
 from gevent import monkey
 monkey.patch_socket()
 #
@@ -49,11 +51,15 @@ class ZeroFoxMilter(lm.ForkMixin , lm.MilterProtocol):
         self.headers = {"Content-Type": "application/json", "APP_ID":"a02e87e3", "APP_KEY":"1980ed2a6da188b46702ec0971b9fee6"}
         self.timeout = 60
         self.threshold = 60
+        self.logger = logging.getLogger("ZF-Milter")
+        handler = logging.handlers.SysLogHandle(address = '/var/log/zflog')
+        self.logger.addHandler(handler)
     def log(self , msg):
         t = time.strftime('%H:%M:%S')
         print '[%s] %s' % (t , msg)
         sys.stdout.flush()
 
+    # need capability to specify mailFrom and rcptTo for logging via the cmdDict id
     def push(self, id, msg):
         if id in self.msgQueue:
             self.msgQueue[id].append(msg)
@@ -119,46 +125,55 @@ class ZeroFoxMilter(lm.ForkMixin , lm.MilterProtocol):
         badlink = False
         if body is not None:
             # check body for links
-            self.log('finding links')
             links = self.getLinks(body)
             # if the array of links > 0, we have links to check
             if len(links) != 0:
+                # append http:// to links that dont have it
+                links = set(["http://" + s if not s.startswith("http") else s for s in links])
                 # insert each link into the link api for an id
                 # we will later check each id for threshold
-                jobs = [gevent.spawn(self.insertLink, link) for link in links]
-                gevent.joinall(jobs, timeout=15)
-                linkEndPoints = dict([job.value for job in jobs])
-                self.log('Links: %s ' % str(linkEndPoints))
-                # spawn threadpool to asynchronously poll API for a total of one minute to get results
-                checkLinkJobs = [gevent.spawn(self.checkLink, url, id) for url,id in linkEndPoints.items()]
-                gevent.joinall(checkLinkJobs, timeout=60)
-                # gevent will return None to the list, so filter those out
-                checkLinkJobs = filter(None,[job.value for job in checkLinkJobs])
-                if len(checkLinkJobs) != 0:
-                    highest = max([job[1] for job in checkLinkJobs])
-                    self.log('Highest score: %s' % str(highest))
-                    if highest > self.threshold:
-                        badlink = True
-                        self.log('Bad link present!')
+                insertLinkJobs = [gevent.spawn(self.insertLink, link) for link in links]
+                gevent.joinall(insertLinkJobs, timeout=15)
+                #filter out Nones in case for failed api requests
+                insertLinkJobs = filter(None, [job for job in insertLinkJobs])
+                if len(insertLinkJobs) != 0:
+                    linkEndPoints = dict([job.value for job in insertLinkJobs])
+                    self.log('Links to check: %s ' % str(linkEndPoints))
+                    # spawn threadpool to asynchronously poll API for a total of one minute to get results
+                    checkLinkJobs = [gevent.spawn(self.checkLink, url, id) for url,id in linkEndPoints.items()]
+                    gevent.joinall(checkLinkJobs, timeout=60)
+                    # gevent will return None to the list, so filter those out
+                    checkLinkJobs = filter(None,[job.value for job in checkLinkJobs])
+                    if len(checkLinkJobs) != 0:
+                        highest = max([job[1] for job in checkLinkJobs])
+                        self.log('Highest score: %s' % str(highest))
+                        if highest > self.threshold:
+                            badlink = True
+                            url = [item for item in checkLinkJobs if item[1] == highest]
+                            self.log('Bad link present!')
+                            self.logger.warning(json.dumps({"msg":"Bad url present", "url":url, "score":str(highest)}))
             if badlink:
                 self.replBody(self.foundheader + ' ' + body + ' ' + self.footer)
             else:            
                 self.replBody(body + ' ' + self.footer)
             self.remove(cmdDict['i'])
-        #self.setReply('554' , '5.7.1' , 'Rejected because I said so')
         return lm.CONTINUE
 
     # inserts a single link and returns its id
     def insertLink(self, url):
-        #self.log('Inserting %s ' % url)
+        self.log('Inserting %s ' % url)
         apiLinkPayload = {"link": {"uri": url, "threshold": 60}}
         r = requests.post(self.apiLink, data=json.dumps(apiLinkPayload), headers=self.headers)
-        return (url,r.json()['request_id'])
+        resp = r.json()
+        if 'error_message' in resp:
+            return None
+        else:
+            return (url,resp['request_id'])
     def close(self):
         self.log('Close called. QID: %s' % self._qid)
 
     def getLinks(self, body):
-       return re.findall('((?:http://|https://)?(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z0-9\-]+(?:/[a-zA-Z0-9_\-\%/\.#!\?&\+=]+)?)', body)
+       return set(re.findall('((?:http://|https://)?(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z\-]+(?:/[a-zA-Z0-9_\-\%/\.#!\?&\+=]+)?)', body))
 
     def checkLink(self, url, id):
        self.log('Checking URL %s ' % url)
@@ -179,7 +194,7 @@ class ZeroFoxMilter(lm.ForkMixin , lm.MilterProtocol):
                    lcv = False
                else:
                    gevent.sleep(1)
-       return default
+       return (url,default)
 
 def runZeroFoxMilter():
     import signal , traceback
