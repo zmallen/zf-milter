@@ -7,7 +7,8 @@
 ## Return REJECT,TEMPFAIL,ACCEPT to short circuit processing for a message.
 ## You can also add/del recipients, replacebody, add/del headers, etc.
 
-import Milter, re, StringIO, time, email, sys, gevent, requests
+import Milter, re, StringIO, time, email, sys, gevent, requests, logging, rfc822, mime, tempfile
+from bs4 import BeautifulSoup
 from socket import AF_INET, AF_INET6
 import simplejson as json
 from gevent import monkey
@@ -30,10 +31,12 @@ class zfMilter(Milter.Base):
     self.footer = '''____________________________________________________________________
             This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com
  _____________________________________________________________________'''
+    self.footer_html = '''____________________________________________________________________<br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br>____________________________________________________________________'''
     self.foundheader = '''************************************************************************************************
        USE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.
        ************************************************************************************************\n'''
     self.headers = {"Content-Type":"application/json", "APP_ID":"a02e87e3", "APP_KEY":"1980ed2a6da188b46702ec0971b9fee6"}
+    self.mail_headers = {}
     self.timeout = 60
     self.threshold = 60
 
@@ -75,10 +78,10 @@ class zfMilter(Milter.Base):
     self.R = []  # list of recipients
     self.fromparms = Milter.dictfromlist(str)   # ESMTP parms
     self.user = self.getsymval('{auth_authen}') # authenticated user
-    #self.log("mail from:", mailfrom, *str)
+    self.log("mail from:", mailfrom, *str)
     self.fp = StringIO.StringIO()
     self.canon_from = '@'.join(parse_addr(mailfrom))
-    self.fp.write('From %s %s\n' % (self.canon_from,time.ctime()))
+    #self.fp.write('From %s %s\n' % (self.canon_from,time.ctime()))
     return Milter.CONTINUE
 
 
@@ -105,15 +108,54 @@ class zfMilter(Milter.Base):
     return Milter.CONTINUE
 
   def getbody(self, msg):
-    if msg.is_multipart():
-        return "\n".join(payload for payload in msg.get_payload())
-    else:
-        return msg.get_payload()
+    for part in msg.walk():
+        if part.get_content_maintype() == 'multipart':
+            continue
+        if part.get_content_subtype() == 'plain':
+            payload = part.get_payload()
+            part.set_payload(payload + '\n' + self.footer)
+        if part.get_content_subtype() == 'html':
+            html = part.get_payload()
+            if '</body>' in html:
+                print 'in replace'
+                html = html.replace("""</body>""", """%s</body>""" % self.footer_html)
+                part.set_payload(html)
+            else:
+                payload = part.get_payload()
+                part.set_payload(payload + '\n' + self.footer) 
+    return msg   
 
   def eom(self):
     self.fp.seek(0)
-    msg = email.message_from_file(self.fp)
-    body = msg.get_payload()
+    msg = mime.message_from_file(self.fp)
+    if (msg.ismultipart()):
+        print 'multipart!'
+        msg = self.getbody(msg)
+    else:
+        print 'not multipart'
+        print msg.get_payload()
+        msg.set_payload(msg.get_payload() + '\n' + self.footer)
+    # parse here for urls
+    out = tempfile.TemporaryFile()  
+    try:
+        msg.dump(out)
+        out.seek(0)
+        msg = rfc822.Message(out)
+        msg.rewindbody()
+        while 1:
+            buf = out.read(8192)
+            if len(buf) == 0: break
+            self.replacebody(buf)
+    except Error as e:
+        self.log(str(e))
+    finally:
+        out.close()
+    return Milter.ACCEPT
+    # this is for later
+    body = self.getbody(msg) + "\n" + self.footer
+    # add to end
+    # testing
+    body = None
     badlink = False
     if body is not None:
       # check body for links
