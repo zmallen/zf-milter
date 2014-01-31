@@ -8,7 +8,6 @@
 ## You can also add/del recipients, replacebody, add/del headers, etc.
 
 import Milter, re, StringIO, time, email, sys, gevent, requests, logging, rfc822, mime, tempfile
-from bs4 import BeautifulSoup
 from socket import AF_INET, AF_INET6
 import simplejson as json
 from gevent import monkey
@@ -28,10 +27,9 @@ class zfMilter(Milter.Base):
     self.id = Milter.uniqueID()  # Integer incremented with each call.
     self.apiLink = "http://api.riskive.com/v2/link"
     self.apiLinkCheck = "http://api.riskive.com/v2/linkcheck/"
-    self.footer = '''____________________________________________________________________
-            This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com
- _____________________________________________________________________'''
-    self.footer_html = '''____________________________________________________________________<br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br>____________________________________________________________________'''
+    self.footer = '''____________________________________________________________________\nThis email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com
+'''
+    self.footer_html = '''<hr><br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>'''
     self.foundheader = '''************************************************************************************************
        USE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.
        ************************************************************************************************\n'''
@@ -66,7 +64,6 @@ class zfMilter(Milter.Base):
   def hello(self, heloname):
     self.H = heloname
     #self.log("HELO %s" % heloname)
-    print 'HELO %s' % heloname
     if heloname.find('.') < 0:  # illegal helo name
       self.setreply('550','5.7.1','Sheesh people!  Use a proper helo name!')
       return Milter.REJECT
@@ -78,7 +75,7 @@ class zfMilter(Milter.Base):
     self.R = []  # list of recipients
     self.fromparms = Milter.dictfromlist(str)   # ESMTP parms
     self.user = self.getsymval('{auth_authen}') # authenticated user
-    self.log("mail from:", mailfrom, *str)
+    #self.log("mail from:", mailfrom, *str)
     self.fp = StringIO.StringIO()
     self.canon_from = '@'.join(parse_addr(mailfrom))
     #self.fp.write('From %s %s\n' % (self.canon_from,time.ctime()))
@@ -117,7 +114,6 @@ class zfMilter(Milter.Base):
         if part.get_content_subtype() == 'html':
             html = part.get_payload()
             if '</body>' in html:
-                print 'in replace'
                 html = html.replace("""</body>""", """%s</body>""" % self.footer_html)
                 part.set_payload(html)
             else:
@@ -129,11 +125,8 @@ class zfMilter(Milter.Base):
     self.fp.seek(0)
     msg = mime.message_from_file(self.fp)
     if (msg.ismultipart()):
-        print 'multipart!'
         msg = self.getbody(msg)
     else:
-        print 'not multipart'
-        print msg.get_payload()
         msg.set_payload(msg.get_payload() + '\n' + self.footer)
     # parse here for urls
     out = tempfile.TemporaryFile()  
