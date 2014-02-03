@@ -27,9 +27,12 @@ class zfMilter(Milter.Base):
     self.id = Milter.uniqueID()  # Integer incremented with each call.
     self.apiLink = "http://api.riskive.com/v2/link"
     self.apiLinkCheck = "http://api.riskive.com/v2/linkcheck/"
-    self.footer = '''____________________________________________________________________\nThis email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com
-'''
-    self.footer_html = '''<hr><br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>'''
+    self.line = "-" * 64
+    self.footer = '''\n\n
+\n\nThis email was scanned by the ZeroFOX Protection Cloud security service.\nFor more information please visit http://www.ZeroFOX.com
+    \n\n'''
+    self.footer_html = '''<br><hr>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>'''
+    self.footer_regex = r'''(____________________________________________________________________\nThis email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com)|(<hr><br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>)'''
     self.foundheader = '''************************************************************************************************
        USE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.
        ************************************************************************************************\n'''
@@ -109,16 +112,25 @@ class zfMilter(Milter.Base):
         if part.get_content_maintype() == 'multipart':
             continue
         if part.get_content_subtype() == 'plain':
-            payload = part.get_payload()
-            part.set_payload(payload + '\n' + self.footer)
+#            payload = re.sub(self.footer_regex,'',part.get_payload())
+             payload = part.get_payload()
+#            print 'payload plain -> ' + payload
+             new_pay = payload + self.footer
+             part.set_payload(new_pay)
         if part.get_content_subtype() == 'html':
+#            html = re.sub(self.footer_regex,'',part.get_payload())
             html = part.get_payload()
+ #           print 'payload html -> ' + html
             if '</body>' in html:
                 html = html.replace("""</body>""", """%s</body>""" % self.footer_html)
                 part.set_payload(html)
             else:
-                payload = part.get_payload()
-                part.set_payload(payload + '\n' + self.footer) 
+            #    if '</div>' in html:
+            #        html = html.replace("""</div>""", """%s</div>""" % self.footer_html)
+             #   else: 
+                    payload = part.get_payload()
+                    new_pay = payload + self.footer_html
+                    part.set_payload(new_pay) 
     return msg   
 
   def eom(self):
@@ -127,7 +139,10 @@ class zfMilter(Milter.Base):
     if (msg.ismultipart()):
         msg = self.getbody(msg)
     else:
-        msg.set_payload(msg.get_payload() + '\n' + self.footer)
+        #payloadout = re.sub(self.footer_regex,'',msg.get_payload())
+        payloadout = msg.get_payload() + self.footer
+      #  print 'payload after -> ' + payloadout
+        msg.set_payload(payloadout)
     # parse here for urls
     out = tempfile.TemporaryFile()  
     try:
