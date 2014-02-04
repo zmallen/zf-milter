@@ -7,11 +7,12 @@
 ## Return REJECT,TEMPFAIL,ACCEPT to short circuit processing for a message.
 ## You can also add/del recipients, replacebody, add/del headers, etc.
 
-import Milter, re, StringIO, time, email, sys, gevent, requests, logging, rfc822, mime, tempfile
+import Milter, re, StringIO, time, email, sys, gevent, requests, logging, rfc822, mime, tempfile, syslog
 from socket import AF_INET, AF_INET6
 import simplejson as json
 from gevent import monkey
-monkey.patch_socket()
+monkey.patch_all()
+syslog.openlog(facility=syslog.LOG_MAIL)
 from Milter.utils import parse_addr
 if True:
   from multiprocessing import Process as Thread, Queue
@@ -28,18 +29,19 @@ class zfMilter(Milter.Base):
     self.apiLink = "http://api.riskive.com/v2/link"
     self.apiLinkCheck = "http://api.riskive.com/v2/linkcheck/"
     self.line = "-" * 64
+    self.ast = "*" * 64
     self.footer = '''\n\n
 \n\nThis email was scanned by the ZeroFOX Protection Cloud security service.\nFor more information please visit http://www.ZeroFOX.com
     \n\n'''
     self.footer_html = '''<br><hr>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>'''
     self.footer_regex = r'''(____________________________________________________________________\nThis email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com)|(<hr><br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>)'''
-    self.foundheader = '''************************************************************************************************
-       USE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.
-       ************************************************************************************************\n'''
-    self.headers = {"Content-Type":"application/json", "APP_ID":"a02e87e3", "APP_KEY":"1980ed2a6da188b46702ec0971b9fee6"}
+    self.foundheader_html = '''<br>%s<br>USE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this e-mail.<br>%s<br>''' % (self.ast, self.ast)
+    self.foundheader = '''\n%s\nUSE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.\n%s\n''' % (self.ast, self.ast)
+    self.headers = {"Content-Type":"application/json", "APP_ID":"a02e87e3", "APP_KEY":"1980ed2a6da188b46702ec0971b9fee6", "enterprise":"ZeroFoxEmail"}
     self.mail_headers = {}
+    self.sleeptime = 5
     self.timeout = 60
-    self.threshold = 60
+    self.threshold = 20
 
   # each connection runs in its own thread and has its own zfMilter
   # instance.  Python code must be thread safe.  This is trivial if only stuff
@@ -107,43 +109,107 @@ class zfMilter(Milter.Base):
     self.fp.write(chunk)
     return Milter.CONTINUE
 
-  def getbody(self, msg):
+  def setmultifooters(self, msg):
+    links = set()
+    plainVisit = False
+    htmlVisit = False
     for part in msg.walk():
         if part.get_content_maintype() == 'multipart':
             continue
-        if part.get_content_subtype() == 'plain':
-#            payload = re.sub(self.footer_regex,'',part.get_payload())
-             payload = part.get_payload()
-#            print 'payload plain -> ' + payload
+        if not plainVisit and part.get_content_subtype() == 'plain':
+             plainVisit = True
+             payload = part.get_payload(decode=True)
+             links2 = self.getlinks(payload)
+             links = links.union(links2)
              new_pay = payload + self.footer
              part.set_payload(new_pay)
-        if part.get_content_subtype() == 'html':
-#            html = re.sub(self.footer_regex,'',part.get_payload())
-            html = part.get_payload()
- #           print 'payload html -> ' + html
+        if not htmlVisit and part.get_content_subtype() == 'html':
+            htmlVisit = True
+            html = part.get_payload(decode=True)
+            links2 = self.getlinks(payload)
+            links = links.union(self.getlinks(payload))
             if '</body>' in html:
                 html = html.replace("""</body>""", """%s</body>""" % self.footer_html)
                 part.set_payload(html)
             else:
-            #    if '</div>' in html:
-            #        html = html.replace("""</div>""", """%s</div>""" % self.footer_html)
-             #   else: 
-                    payload = part.get_payload()
-                    new_pay = payload + self.footer_html
-                    part.set_payload(new_pay) 
-    return msg   
+                payload = part.get_payload()
+                new_pay = payload + self.footer_html
+                part.set_payload(new_pay) 
+        if plainVisit and htmlVisit:
+            break
+    return msg, links   
+
+  def setmultiheader(self, msg):
+    plainVisit = False
+    htmlVisit = False
+    for part in msg.walk():
+        if part.get_content_maintype() == 'multipart':
+            continue
+        if not plainVisit and part.get_content_subtype() == 'plain':
+            plainVisit = True
+            payload = part.get_payload()
+            new_pay = self.foundheader + payload
+        if not htmlVisit and part.get_content_subtype() == 'html':
+            htmlVisit = True
+            html = part.get_payload()
+            if '<body>' in html:
+                html = html.replace("""<body>""", """<body>%s""" % self.foundheader_html)
+                part.set_payload(html)
+            else:
+                payload = part.get_payload()
+                new_pay = self.foundheader_html + payload
+                part.set_payload(new_pay)
+        if plainVisit and htmlVisit:
+            break
+    return msg
+
+  def logemail(self, msg):
+    fromHeader = str(msg.getheaders('from'))
+    toHeader = str(msg.getheaders('to'))
+    syslog.syslog(syslog.LOG_INFO, json.dumps({"id":"id:%s MAIL" % str(1006), "msg":"email", "to":toHeader, "from":fromHeader}))
 
   def eom(self):
     self.fp.seek(0)
     msg = mime.message_from_file(self.fp)
+    self.logemail(msg)
+    links = set()
     if (msg.ismultipart()):
-        msg = self.getbody(msg)
+        msg, links = self.setmultifooters(msg)
     else:
-        #payloadout = re.sub(self.footer_regex,'',msg.get_payload())
         payloadout = msg.get_payload() + self.footer
-      #  print 'payload after -> ' + payloadout
+        links = self.getlinks(msg.get_payload())
         msg.set_payload(payloadout)
-    # parse here for urls
+    if len(links) != 0:
+        badlink = False
+        # append http:// to links that do not have it
+        links = set(["http://" + s if not s.startswith("http") else s for s in links])
+        # insert each link into the link api for an id
+        # we will later check each id for theeshold
+        insertLinkJobs = [gevent.spawn(self.insertLink, link) for link in links]
+        gevent.joinall(insertLinkJobs, timeout=15)
+        # filter out Nones inc ase for failed api eequests
+        insertLinkJobs = filter(None, [job.value for job in insertLinkJobs])
+        if len(insertLinkJobs) > 0:
+            linkEndPoints = [job['request_id'] for job in insertLinkJobs]
+            # spawn threadpool to asynchronously poll API for a total of one minute to get results
+            checkLinkJobs = [gevent.spawn(self.checklink, id) for id in linkEndPoints]
+            gevent.joinall(checkLinkJobs, timeout=60)
+            # gevent will return None to the list if it didnt get an answer, so filter those out
+            checkLinkJobs = filter(None, [job.value for job in checkLinkJobs])
+            # got some scores!
+            if len(checkLinkJobs) != 0:
+                highest = max([job[1] for job in checkLinkJobs])
+                self.log('Highest score: %s' % str(highest))
+                if highest > self.threshold:
+                    badlink = True
+                    url = [ item[0] for item in checkLinkJobs if item[1] == highest]
+                    syslog.syslog(syslog.LOG_WARNING, (json.dumps({"id":"id:%s BADURLPRESENT" % str(2003), "msg":"BADURLPRESENT", "url":str(url), "score":str(highest), "time":time.strftime('%y%b%d %H:%M:%S'), "to":str(msg.getheaders('to')), "from":str(msg.getheaders('from'))})))
+        if badlink:
+            if msg.ismultipart():
+                msg = self.setmultiheader(msg)
+            else:
+                payloadout = self.foundheader + msg.get_payload()
+                msg.set_payload(payloadout)
     out = tempfile.TemporaryFile()  
     try:
         msg.dump(out)
@@ -159,49 +225,8 @@ class zfMilter(Milter.Base):
     finally:
         out.close()
     return Milter.ACCEPT
-    # this is for later
-    body = self.getbody(msg) + "\n" + self.footer
-    # add to end
-    # testing
-    body = None
-    badlink = False
-    if body is not None:
-      # check body for links
-      links = self.getLinks(body)
-      # if the array of links > 0, we have links to check
-      if len(links) != 0:
-        # append http:// to links that dont have it
-        links = set(["http://" + s if not s.startswith("http") else s for s in links])
-        # insert each link into the link api for an id
-        # we will later check each id for threshold
-        insertLinkJobs = [gevent.spawn(self.insertLink, link) for link in links]
-        gevent.joinall(insertLinkJobs, timeout=15)
-        #filter out Nones in case for failed api requests
-        insertLinkJobs = filter(None, [job.value for job in insertLinkJobs])
-        if len(insertLinkJobs) > 0:
-            linkEndPoints = [job['request_id'] for job in insertLinkJobs]
-            # spawn threadpool to asynchronously poll API for a total of one minute to get results
-            checkLinkJobs = [gevent.spawn(self.checkLink, id) for id in linkEndPoints]
-            gevent.joinall(checkLinkJobs, timeout=60)
-            # gevent will return None to the list, so filter those out
-            checkLinkJobs = filter(None,[job.value for job in checkLinkJobs])
-            if len(checkLinkJobs) != 0:
-                highest = max([job[1] for job in checkLinkJobs])
-                self.log('Highest score: %s' % str(highest))
-                if highest > self.threshold:
-                    badlink = True
-                    url = [item[0] for item in checkLinkJobs if item[1] == highest]
-                    self.log(json.dumps({"msg":"Bad url present", "url":url, "score":str(highest)}))
-        if badlink:
-            self.replacebody(self.foundheader + ' ' + body + ' ' + self.footer)
-        else:            
-            self.replacebody(body + ' ' + self.footer)
-    # many milter functions can only be called from eom()
-    # example of adding a Bcc:
-    return Milter.ACCEPT
 
   def insertLink(self, url):
-  #      self.log('Inserting %s ' % url)
         apiLinkPayload = {"link": {"uri": url, "threshold": 60}}
         r = requests.post(self.apiLink, data=json.dumps(apiLinkPayload), headers=self.headers)
         resp = r.json()
@@ -212,10 +237,10 @@ class zfMilter(Milter.Base):
             return resp
 
   # parse email content with python email parser
-  def getLinks(self, body):
+  def getlinks(self, body):
      return set(re.findall('((?:http://|https://)?(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z\-]+(?:/[a-zA-Z0-9_\-\%/\.#!\?&\+=]+)?)', body))
 
-  def checkLink(self, id):
+  def checklink(self, id):
      default = 0 
      maxRetries = 0
      endpt = self.apiLinkCheck + id
@@ -223,14 +248,16 @@ class zfMilter(Milter.Base):
      while lcv:
          r = requests.get(endpt, headers=self.headers)
          r_json = r.json()
-         if r_json['done']:
-             return (r_json['response']['info']['url'],r_json['response']['info']['score'])
+         if r_json.has_key('error_code'):
+             return None
+         elif r_json.has_key('done'):
+             if r_json['done']:
+                return (r_json['response']['info']['url'],r_json['response']['info']['score'])
+         maxRetries += 1
+         if (maxRetries * self.sleeptime) >= self.timeout:
+             lcv = False
          else:
-             maxRetries += 1
-             if maxRetries == self.timeout:
-                 lcv = False
-             else:
-                 gevent.sleep(1)
+             gevent.sleep(self.sleeptime)
      return default
 
   def close(self):
@@ -270,7 +297,7 @@ def main():
   flags += Milter.ADDRCPT
   flags += Milter.DELRCPT
   Milter.set_flags(flags)       # tell Sendmail which features we use
-  print "%s milter startup" % time.strftime('%Y%b%d %H:%M:%S')
+  syslog.syslog(syslog.LOG_INFO, json.dumps({"id":"id:%s MILTERSTART" % str(1005), "msg":"%s milter startup" % time.strftime('%Y%b%d %H:%M:%S')}))
   sys.stdout.flush()
   Milter.runmilter("zfmilter",socketname,timeout)
   logq.put(None)
