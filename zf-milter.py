@@ -37,7 +37,7 @@ class zfMilter(Milter.Base):
     self.footer_regex = r'''(____________________________________________________________________\nThis email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com)|(<hr><br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>)'''
     self.foundheader_html = '''<br>%s<br>USE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this e-mail.<br>%s<br>''' % (self.ast, self.ast)
     self.foundheader = '''\n%s\nUSE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.\n%s\n''' % (self.ast, self.ast)
-    self.headers = {"Content-Type":"application/json", "APP_ID":"a02e87e3", "APP_KEY":"1980ed2a6da188b46702ec0971b9fee6", "enterprise":"ZeroFoxEmail"}
+    self.headers = {"Content-Type":"application/json", "APP_ID":"a02e87e3", "APP_KEY":"1980ed2a6da188b46702ec0971b9fee6"}
     self.mail_headers = {}
     self.sleeptime = 5
     self.timeout = 60
@@ -227,7 +227,7 @@ class zfMilter(Milter.Base):
     return Milter.ACCEPT
 
   def insertLink(self, url):
-        apiLinkPayload = {"link": {"uri": url, "threshold": 60}}
+        apiLinkPayload = {"link": {"uri": url, "threshold": 60, "enterprise":"ZeroFoxEmail"}}
         r = requests.post(self.apiLink, data=json.dumps(apiLinkPayload), headers=self.headers)
         resp = r.json()
         if 'error_message' in resp:
