@@ -41,7 +41,7 @@ class zfMilter(Milter.Base):
     self.mail_headers = {}
     self.sleeptime = 5
     self.timeout = 60
-    self.threshold = 20
+    self.threshold = 60
 
   # each connection runs in its own thread and has its own zfMilter
   # instance.  Python code must be thread safe.  This is trivial if only stuff
