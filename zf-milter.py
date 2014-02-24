@@ -3,16 +3,10 @@
 #  based on Sendmail's milter API http://www.milter.org/milter_api/api.html
 #  This code is open-source on the same terms as Python.
 
-## Milter calls methods of your class at milter events.
-## Return REJECT,TEMPFAIL,ACCEPT to short circuit processing for a message.
-## You can also add/del recipients, replacebody, add/del headers, etc.
-
 import Milter, re, StringIO, time, email, sys, gevent, requests, logging, rfc822, mime, tempfile, syslog, signal, time
 from threading import Thread
 from socket import AF_INET, AF_INET6
 import simplejson as json
-from gevent import monkey
-monkey.patch_socket()
 syslog.openlog(facility=syslog.LOG_MAIL)
 from Milter.utils import parse_addr
 
@@ -29,13 +23,13 @@ class zfMilter(Milter.Base):
     \n\n'''
     self.footer_html = '''<br><hr>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>'''
     self.footer_regex = r'''(____________________________________________________________________\nThis email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com)|(<hr><br>This email was scanned by the ZeroFOX Protection Cloud security service. For more information please visit http://www.ZeroFOX.com<br><hr>)'''
-    self.foundheader_html = '''<br>%s<br>USE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this e-mail.<br>%s<br>''' % (self.ast, self.ast)
-    self.foundheader = '''\n%s\nUSE CAUTION: The ZeroFOX Protection Cloud has identified potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.\n%s\n''' % (self.ast, self.ast)
-    self.headers = {"Content-Type":"application/json", "APP_ID":"a02e87e3", "APP_KEY":"1980ed2a6da188b46702ec0971b9fee6"}
+    self.foundheader_html = '''<br>%s<br>USE CAUTION: There is potentially dangerous content within this e-mail. Please take caution when clicking on links and downloading attachments.<br>%s<br>''' % (self.ast, self.ast)
+    self.foundheader = '''\n%s\nUSE CAUTION: There is potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.\n%s\n''' % (self.ast, self.ast)
+    self.headers = {"Content-Type":"application/json", "APP_ID":"APPIDHERE", "APP_KEY":"APPKEYHERE"}
     self.mail_headers = {}
     self.sleeptime = 5
     self.link_timeo = 60
-    self.threshold = 60
+    self.threshold = 70
     self.linkscoremap = {}
 
   # each connection runs in its own thread and has its own zfMilter
@@ -111,16 +105,22 @@ class zfMilter(Milter.Base):
         if not plainVisit and part.get_content_subtype() == 'plain':
              plainVisit = True
              email_charset = part.get_charset()
+             # decode it so it so we can scan emails
              payload = part.get_payload(decode=True)
              links2 = self.getlinks(payload)
+             # get the payload again, to keep its original encoding
+             payload = part.get_payload()
              links = links.union(links2)
              new_pay = payload + self.footer
              part.set_payload(new_pay, email_charset)
         if not htmlVisit and part.get_content_subtype() == 'html':
             htmlVisit = True
             email_charset = part.get_charset()
+            # decode payload so we can scan emails without worrying about formatting
             html = part.get_payload(decode=True)
             links2 = self.getlinks(html)
+            # get the payload again, to keep its original encoding
+            html = part.get_payload()            
             links = links.union(self.getlinks(html))
             if '</body>' in html:
                 html = html.replace("""</body>""", """%s</body>""" % self.footer_html)
@@ -193,7 +193,7 @@ class zfMilter(Milter.Base):
             if highest > self.threshold:
                 badlink = True
                 url = [urlTup[0] for urlTup in self.linkscoremap.values() if urlTup[1] == highest]
-                syslog.syslog(syslog.LOG_WARNING, (json.dumps({"id":"id:%s BADURLPRESENT" % str(2003), "msg":"BADURLPRESENT", "url":str(url), "score":str(highest), "time":time.strftime('%y%b%d %H:%M:%S'), "to":str(msg.getheaders('to')), "from":str(msg.getheaders('from'))})))
+                syslog.syslog(syslog.LOG_WARNING, (json.dumps({"msg":"BADURLPRESENT", "url":str(url), "score":str(highest), "time":time.strftime('%y%b%d %H:%M:%S'), "to":str(msg.getheaders('to')), "from":str(msg.getheaders('from'))})))
             if badlink:
                 if msg.ismultipart():
                     msg = self.setmultiheader(msg)
@@ -210,14 +210,18 @@ class zfMilter(Milter.Base):
             if len(buf) == 0: break
             self.replacebody(buf)
     except Exception, e:
-        syslog.syslog(syslog.LOG_WARNING, (json.dumps({id:"id:%s ERRORMILTER" % str(2006), "msg":str(e)}))) 
+       self.logexception(str(e))
     finally:
-        out.close()
+        try:
+          out.close()
+        except Exception, e:
+          self.logexception(str(e))
+          pass
     return Milter.ACCEPT
 
   def insertLink(self, url):
     try:
-        apiLinkPayload = {"link": {"uri": url, "threshold": 60, "enterprise":"ZeroFoxEmail"}}
+        apiLinkPayload = {"link": {"uri": url, "threshold": 60}}
         r = requests.post(self.apiLink, data=json.dumps(apiLinkPayload), headers=self.headers)
         resp = r.json()
         if 'error_message' in resp:
@@ -232,9 +236,9 @@ class zfMilter(Milter.Base):
   def getlinks(self, body):
      return set(re.findall('((?:http://|https://)?(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z\-]+(?:/[a-zA-Z0-9_\-\%/\.#!\?&\+=]+)?)', body))
 
-  def checklink(self, id, url):
+  def checklink(self, url_id, url):
      maxRetries = 0
-     endpt = self.apiLinkCheck + id
+     endpt = self.apiLinkCheck + url_id
      lcv = True
      while lcv:
          r = requests.get(endpt, headers=self.headers)
@@ -244,15 +248,17 @@ class zfMilter(Milter.Base):
          elif r_json.has_key('done'):
              if r_json['done']:
                 score = r_json['response']['info']['score']
-                self.linkscoremap[id] = [url,r_json['response']['info']['score']]
+                self.linkscoremap[url_id] = [url,r_json['response']['info']['score']]
                 return
-                #return (r_json['response']['info']['url'],r_json['response']['info']['score'])
-         maxRetries += self.sleeptime
+x         maxRetries += self.sleeptime
          if maxRetries >= self.link_timeo:
              lcv = False
          else:
              time.sleep(self.sleeptime)
      return
+  
+  def logexception(self, err):
+    syslog.syslog(syslog.LOG_WARNING, json.dumps({"msg":"%s" % err}))
 
   def close(self):
     # always called, even when abort is called.  Clean up
@@ -273,10 +279,10 @@ def main():
   flags += Milter.ADDRCPT
   flags += Milter.DELRCPT
   Milter.set_flags(flags)       # tell Sendmail which features we use
-  syslog.syslog(syslog.LOG_INFO, json.dumps({"id":"id:%s MILTERSTART" % str(1005), "msg":"%s milter startup" % time.strftime('%Y%b%d %H:%M:%S')}))
+  syslog.syslog(syslog.LOG_INFO, json.dumps({"msg":"%s milter startup" % time.strftime('%Y%b%d %H:%M:%S')}))
   sys.stdout.flush()
   Milter.runmilter("zfmilter",socketname,timeout)
-  print "%s bms milter shutdown" % time.strftime('%Y%b%d %H:%M:%S')
+  print "%s zf milter shutdown" % time.strftime('%Y%b%d %H:%M:%S')
 
 if __name__ == "__main__":
   main()
