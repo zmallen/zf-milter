@@ -26,7 +26,6 @@ class zfMilter(Milter.Base):
     self.foundheader_html = '''<br>%s<br>USE CAUTION: There is potentially dangerous content within this e-mail. Please take caution when clicking on links and downloading attachments.<br>%s<br>''' % (self.ast, self.ast)
     self.foundheader = '''\n%s\nUSE CAUTION: There is potentially dangerous content within this email. Please take caution when clicking on links and downloading attachments.\n%s\n''' % (self.ast, self.ast)
     self.headers = {"Content-Type":"application/json", "APP_ID":"APPIDHERE", "APP_KEY":"APPKEYHERE"}
-    self.mail_headers = {}
     self.sleeptime = 5
     self.link_timeo = 60
     self.threshold = 70
@@ -57,7 +56,6 @@ class zfMilter(Milter.Base):
   def hello(self, heloname):
     self.H = heloname
     if heloname.find('.') < 0:  # illegal helo name
-      self.setreply('550','5.7.1','Sheesh people!  Use a proper helo name!')
       return Milter.REJECT
       
     return Milter.CONTINUE
@@ -159,7 +157,7 @@ class zfMilter(Milter.Base):
   def logemail(self, msg):
     fromHeader = str(msg.getheaders('from'))
     toHeader = str(msg.getheaders('to'))
-    syslog.syslog(syslog.LOG_INFO, json.dumps({"id":"id:%s MAIL" % str(1006), "msg":"email", "to":toHeader, "from":fromHeader}))
+    syslog.syslog(syslog.LOG_INFO, json.dumps({"msg":"email", "to":toHeader, "from":fromHeader}))
 
   def eom(self):
     try:
@@ -176,7 +174,7 @@ class zfMilter(Milter.Base):
             msg.set_payload(payloadout, email_charset)
         if len(links) > 0:
             badlink = False
-            # append http:// to links that do not have it
+            # prepend http:// to links that do not have it
             links = list(set(["http://" + s if not s.startswith("http") else s for s in links]))
             # insert each link into the link api for an id
             # we will later check each id for theeshold
@@ -186,20 +184,23 @@ class zfMilter(Milter.Base):
                 threads[i].start()
             for i in range(len(threads)):
                 threads[i].join()
-            # filter out Nones in case for failed api eequests
-            # gevent will return None to the list if it didnt get an answer, so filter those out
-            # got some scores!
+            # filter out Nones in case for failed api requests
+            # Threads will set None as the value for URLs if it didnt get an answer, so filter those out
+            # Get the max score , if higher than our threshold that we choose, then we assume its bad
             highest = max([urlTup[1] for urlTup in self.linkscoremap.values()])
             if highest > self.threshold:
                 badlink = True
                 url = [urlTup[0] for urlTup in self.linkscoremap.values() if urlTup[1] == highest]
                 syslog.syslog(syslog.LOG_WARNING, (json.dumps({"msg":"BADURLPRESENT", "url":str(url), "score":str(highest), "time":time.strftime('%y%b%d %H:%M:%S'), "to":str(msg.getheaders('to')), "from":str(msg.getheaders('from'))})))
             if badlink:
+                # set the **WARNING** header in both text/plain and text/html
                 if msg.ismultipart():
                     msg = self.setmultiheader(msg)
                 else:
+                    # set the **WARNING** header in just text/plain
                     payloadout = self.foundheader + msg.get_payload()
                     msg.set_payload(payloadout)
+        # write out to temp file and then encode to forward out to postfix
         out = tempfile.TemporaryFile()  
         msg.dump(out)
         out.seek(0)
@@ -218,7 +219,9 @@ class zfMilter(Milter.Base):
           self.logexception(str(e))
           pass
     return Milter.ACCEPT
-
+  # insertLink performs step 1 of 2 for our link check analysis
+  # we first insert the link into the API and get a unique id back to check up on as
+  # we analyze the link
   def insertLink(self, url):
     try:
         apiLinkPayload = {"link": {"uri": url, "threshold": 60}}
@@ -236,6 +239,9 @@ class zfMilter(Milter.Base):
   def getlinks(self, body):
      return set(re.findall('((?:http://|https://)?(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z\-]+(?:/[a-zA-Z0-9_\-\%/\.#!\?&\+=]+)?)', body))
 
+  # checklink performs step 2 for our link check analysis
+  # we take the URLs unique id and check to see if the analysis is complete
+  # if not, sleep for sleeptime until maxRetries then return if we couldnt get anything
   def checklink(self, url_id, url):
      maxRetries = 0
      endpt = self.apiLinkCheck + url_id
@@ -243,17 +249,23 @@ class zfMilter(Milter.Base):
      while lcv:
          r = requests.get(endpt, headers=self.headers)
          r_json = r.json()
+         # API returned an error
          if r_json.has_key('error_code'):
              return
+         # API finished processing
          elif r_json.has_key('done'):
+              # API is done with link analysis
              if r_json['done']:
+                # get score from API json body
                 score = r_json['response']['info']['score']
+                # add score to the URL link map
                 self.linkscoremap[url_id] = [url,r_json['response']['info']['score']]
                 return
-x         maxRetries += self.sleeptime
+         maxRetries += self.sleeptime
          if maxRetries >= self.link_timeo:
              lcv = False
          else:
+             #sleep for sleeptime
              time.sleep(self.sleeptime)
      return
   
@@ -271,10 +283,12 @@ x         maxRetries += self.sleeptime
 ## ===
     
 def main():
+  # fully qualified name for the socket, postfix will only see /var/run/zf/sock
   socketname = "/var/spool/postfix/var/run/zf/sock"
   timeout = 600
   # Register to have the Milter factory create instances of your class:
   Milter.factory = zfMilter
+  # these flags allow us to change the body, recipients and headers
   flags = Milter.CHGBODY + Milter.CHGHDRS + Milter.ADDHDRS
   flags += Milter.ADDRCPT
   flags += Milter.DELRCPT
